@@ -1,147 +1,101 @@
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import morgan from "morgan";
-import rateLimit from "express-rate-limit";
-import dotenv from "dotenv";
-import axios from "axios";
-
-dotenv.config();
-
-const {
-  PORT = 8080,
-  CORS_ORIGIN = "*",
-  HMS_MANAGEMENT_TOKEN,
-  HMS_ROOM_CODE_HOST,
-  HMS_ROOM_CODE_GUEST,
-  HMS_API_BASE // может быть пустым — добавим автоподбор
-} = process.env;
-
-// Нормализатор базового URL
-const norm = (s) => (s || "").replace(/\/+$/, "");
-
-// Кандидаты баз 100ms (попробуем по очереди)
-const API_BASE_CANDIDATES = [
-  norm(HMS_API_BASE),                 // то, что ты задал (может быть пустым)
-  "https://prod-in2.100ms.live",      // кластер IN2 (часто у тебя в ответах)
-  "https://api.100ms.live"            // универсальный
-].filter(Boolean);
+// backend/index.js  (CommonJS-версия — просто вставь и сохрани)
+const express = require('express');
+const cors = require('cors');
 
 const app = express();
-app.disable("x-powered-by");
-app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors({ origin: CORS_ORIGIN === "*" ? true : [CORS_ORIGIN], methods: ["GET", "POST"] }));
+
+// CORS: для теста можно '*', для прод — точный домен фронта
+const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || '*';
+app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
 app.use(express.json());
-app.use(morgan("combined"));
 
-app.use("/api/token", rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+// Берём Room Code по роли
+function getRoomCodeByRole(role) {
+  return role === 'host'
+    ? process.env.HMS_ROOM_CODE_HOST
+    : process.env.HMS_ROOM_CODE_GUEST;
+}
 
-// ===== Диагностика окружения (временно, УДАЛИ после починки) =====
-app.get("/api/debug/env", (_req, res) => {
+// Меняем room code -> token через правильный сервис авторизации
+async function tokenByRoomCode({ role, user }) {
+  const code = getRoomCodeByRole(role);
+  if (!code) {
+    return { status: 400, body: { error: 'Missing room code for role', detail: { role } } };
+  }
+  const r = await fetch('https://auth.100ms.live/v2/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code, user_id: user || undefined }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) return { status: r.status, body: { error: 'Failed to get token', detail: data } };
+
+  const token = data.token || data.authToken || data.access_token;
+  if (!token) return { status: 500, body: { error: 'No token in response', detail: data } };
+
+  return { status: 200, body: { token } };
+}
+
+// Основной POST-роут для фронта
+app.post('/api/token', async (req, res) => {
+  try {
+    const { role, user } = req.body || {};
+    const out = await tokenByRoomCode({ role, user });
+    return res.status(out.status).json(out.body);
+  } catch (e) {
+    return res.status(500).json({ error: 'Server error', detail: String(e) });
+  }
+});
+
+// Дополнительный GET — удобно проверять из браузера
+app.get('/api/token', async (req, res) => {
+  try {
+    const { role, user } = req.query || {};
+    const out = await tokenByRoomCode({ role, user });
+    return res.status(out.status).json(out.body);
+  } catch (e) {
+    return res.status(500).json({ error: 'Server error', detail: String(e) });
+  }
+});
+
+// Отладка ENV — видно, что сервер «видит»
+app.get('/api/debug/env', (_req, res) => {
   res.json({
-    PORT,
-    CORS_ORIGIN,
-    HMS_API_BASE: HMS_API_BASE || null,
-    HMS_MANAGEMENT_TOKEN_SET: !!HMS_MANAGEMENT_TOKEN,
-    HMS_ROOM_CODE_HOST: HMS_ROOM_CODE_HOST || null,
-    HMS_ROOM_CODE_GUEST: HMS_ROOM_CODE_GUEST || null,
-    API_BASE_CANDIDATES
+    PORT: process.env.PORT,
+    CORS_ORIGIN: process.env.CORS_ORIGIN || '*',
+    HMS_API_BASE: null, // больше не используем
+    HMS_MANAGEMENT_TOKEN_SET: !!process.env.HMS_MANAGEMENT_TOKEN,
+    HMS_ROOM_CODE_HOST: process.env.HMS_ROOM_CODE_HOST,
+    HMS_ROOM_CODE_GUEST: process.env.HMS_ROOM_CODE_GUEST,
+    API_BASE_CANDIDATES: ['https://prod-in2.100ms.live', 'https://api.100ms.live'],
   });
 });
 
-// ===== Получить список room codes от 100ms (временно, УДАЛИ потом) =====
-app.get("/api/debug/room-codes", async (_req, res) => {
-  try {
-    if (!HMS_MANAGEMENT_TOKEN) {
-      return res.status(400).json({ error: "HMS_MANAGEMENT_TOKEN missing" });
-    }
-    let lastErr = null;
-    for (const base of API_BASE_CANDIDATES) {
-      try {
-        const url = `${base}/v2/room-codes?enabled=true`;
-        const { data } = await axios.get(url, {
-          headers: { Authorization: `Bearer ${HMS_MANAGEMENT_TOKEN}` }
-        });
-        return res.json({ api_base_used: base, data });
-      } catch (e) {
-        lastErr = { base, status: e?.response?.status, body: e?.response?.data || e.message };
-      }
-    }
-    return res.status(500).json({ error: "failed_all_bases", lastErr });
-  } catch (e) {
-    return res.status(500).json({ error: "debug_failed", detail: e.message });
-  }
+// Отладка Room Codes — "пингуем" через auth-сервис (без выдачи токенов)
+app.get('/api/debug/room-codes', async (_req, res) => {
+  const check = async (code) => {
+    if (!code) return { ok: false, status: 400, detail: 'missing_code' };
+    const r = await fetch('https://auth.100ms.live/v2/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    return { ok: r.ok, status: r.status };
+  };
+
+  const host = await check(process.env.HMS_ROOM_CODE_HOST);
+  const guest = await check(process.env.HMS_ROOM_CODE_GUEST);
+  const mask = (v) => (v ? v.replace(/.(?=.{4})/g, '*') : null);
+
+  res.json({
+    host_code_masked: mask(process.env.HMS_ROOM_CODE_HOST),
+    guest_code_masked: mask(process.env.HMS_ROOM_CODE_GUEST),
+    checks: { host, guest },
+  });
 });
 
-// ===== Вспомогательная: запрос токена у 100ms по room code с авто-перебором баз =====
-async function getTokenByRoomCode(roomCode, userId = "user_" + Date.now()) {
-  if (!HMS_MANAGEMENT_TOKEN) throw new Error("HMS_MANAGEMENT_TOKEN is missing");
-  if (!roomCode) throw new Error("roomCode is missing");
+// Healthcheck
+app.get('/', (_req, res) => res.send('youcan-backend OK'));
 
-  let lastErr = null;
-  for (const base of API_BASE_CANDIDATES) {
-    const url = `${base}/v2/room-codes/${roomCode}/token`;
-    try {
-      const resp = await axios.post(
-        url,
-        { user_id: userId }, // role НЕ нужно — оно зашито в room code на стороне 100ms
-        {
-          headers: {
-            Authorization: `Bearer ${HMS_MANAGEMENT_TOKEN}`,
-            "Content-Type": "application/json"
-          },
-          timeout: 12000
-        }
-      );
-      const token = resp?.data?.token;
-      if (!token) throw new Error("No token returned from 100ms");
-      // лог успеха — какую базу использовали
-      console.log("TOKEN OK via", base);
-      return token;
-    } catch (e) {
-      lastErr = { base, status: e?.response?.status, body: e?.response?.data || e.message };
-      console.error("TOKEN ERROR DETAIL:", lastErr);
-      // пробуем следующий base
-    }
-  }
-  // если не сработал ни один base
-  throw new Error(`All API bases failed: ${JSON.stringify(lastErr)}`);
-}
-
-// ===== Основной эндпойнт для фронта =====
-// GET /api/token?role=host|guest&user=Имя
-app.get("/api/token", async (req, res) => {
-  try {
-    const role = req.query.role === "host" ? "host" : "guest";
-    const user = (req.query.user || (role === "host" ? "teacher" : "student")).toString();
-
-    const roomCode =
-      role === "host" ? HMS_ROOM_CODE_HOST : HMS_ROOM_CODE_GUEST;
-
-    if (!roomCode) {
-      return res.status(400).json({ error: "Room code for role is not configured" });
-    }
-
-    const token = await getTokenByRoomCode(roomCode, user);
-    return res.json({ token });
-  } catch (err) {
-    const msg = err?.message || "unknown";
-    console.error("TOKEN FINAL ERROR:", msg);
-    return res.status(500).json({ error: "Failed to get token", detail: msg });
-  }
-});
-
-app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
-app.get("/", (_req, res) => res.send("YouCan backend OK"));
-
-app.listen(PORT, () => {
-  console.log(`✅ Backend listening on :${PORT}`);
-  console.log(`   Health: GET /healthz`);
-  console.log(`   Debug : GET /api/debug/env , /api/debug/room-codes`);
-  console.log(`   Token : GET /api/token?role=guest&user=Test`);
-});
+const PORT = process.env.PORT || 3000; // Render сам подставит PORT
+app.listen(PORT, () => console.log(`Server on ${PORT}`));
