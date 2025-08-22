@@ -1,34 +1,39 @@
-// backend/index.js  (CommonJS-версия — просто вставь и сохрани)
-const express = require('express');
-const cors = require('cors');
+// index.js  (ESM-версия — совместима с "type": "module")
+import express from 'express';
+import cors from 'cors';
 
 const app = express();
 
-// CORS: для теста можно '*', для прод — точный домен фронта
+// CORS: на тестах можно '*', в проде укажи точный домен фронта
 const ALLOWED_ORIGIN = process.env.CORS_ORIGIN || '*';
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN }));
 app.use(express.json());
 
-// Берём Room Code по роли
+// Выбор Room Code по роли
 function getRoomCodeByRole(role) {
   return role === 'host'
     ? process.env.HMS_ROOM_CODE_HOST
-    : process.env.HMS_ROOM_CODE_GUEST;
+    : process.env.HMS_ROOM_CODE_GUEST; // по умолчанию guest
 }
 
-// Меняем room code -> token через правильный сервис авторизации
+// Обмен room code → auth token через сервис авторизации 100ms
 async function tokenByRoomCode({ role, user }) {
   const code = getRoomCodeByRole(role);
   if (!code) {
     return { status: 400, body: { error: 'Missing room code for role', detail: { role } } };
   }
+
+  // Node 18+ имеет глобальный fetch — импорт не нужен
   const r = await fetch('https://auth.100ms.live/v2/token', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ code, user_id: user || undefined }),
   });
+
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) return { status: r.status, body: { error: 'Failed to get token', detail: data } };
+  if (!r.ok) {
+    return { status: r.status, body: { error: 'Failed to get token', detail: data } };
+  }
 
   const token = data.token || data.authToken || data.access_token;
   if (!token) return { status: 500, body: { error: 'No token in response', detail: data } };
@@ -36,7 +41,7 @@ async function tokenByRoomCode({ role, user }) {
   return { status: 200, body: { token } };
 }
 
-// Основной POST-роут для фронта
+// Основной POST для фронта
 app.post('/api/token', async (req, res) => {
   try {
     const { role, user } = req.body || {};
@@ -47,7 +52,7 @@ app.post('/api/token', async (req, res) => {
   }
 });
 
-// Дополнительный GET — удобно проверять из браузера
+// Доп. GET — удобно проверять из браузера
 app.get('/api/token', async (req, res) => {
   try {
     const { role, user } = req.query || {};
@@ -58,7 +63,7 @@ app.get('/api/token', async (req, res) => {
   }
 });
 
-// Отладка ENV — видно, что сервер «видит»
+// Отладка ENV (без секретов)
 app.get('/api/debug/env', (_req, res) => {
   res.json({
     PORT: process.env.PORT,
@@ -71,7 +76,7 @@ app.get('/api/debug/env', (_req, res) => {
   });
 });
 
-// Отладка Room Codes — "пингуем" через auth-сервис (без выдачи токенов)
+// Отладка Room Codes — «пингуем» через auth-сервис (токены не выдаём)
 app.get('/api/debug/room-codes', async (_req, res) => {
   const check = async (code) => {
     if (!code) return { ok: false, status: 400, detail: 'missing_code' };
@@ -97,5 +102,6 @@ app.get('/api/debug/room-codes', async (_req, res) => {
 // Healthcheck
 app.get('/', (_req, res) => res.send('youcan-backend OK'));
 
-const PORT = process.env.PORT || 3000; // Render сам подставит PORT
+// Render сам подставляет PORT в переменную окружения
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
